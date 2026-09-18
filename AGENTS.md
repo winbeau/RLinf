@@ -1,5 +1,16 @@
 # AGENTS.md
 
+## Evaluation fork constraints (override upstream operational examples)
+
+This fork maintains evaluation integration on **main**, also its GitHub default. Final user scope is **planning only, execution paused**. Future target: RLinf DreamZero WAN2.2-5B LIBERO-SFT on GPU5; no training authorization. See [handoff](docs/action-eval/README.md).
+
+All projects follow local clone/edit → local git add/commit/push on main → compute-server git pull --ff-only → uv sync --locked → explicitly approved training/evaluation. No local installs or execution; no server application edits or copied-code deployment around Git. Check server edits and active jobs before pull/sync; never reset them. Lock generation only in isolated server staging, returned for local review/commit/push and pulled before execution.
+
+Preserve validated pyproject.toml/uv.lock byte-for-byte where compatible. Pin all necessary additions/build tools/VCS revisions exactly, explain differences and do not upgrade implicitly. Protect existing DreamZero14B environments and Ray instances. Do not run requirements/install.sh wholesale: it can rewrite shared LIBERO config and includes conflicting model dependencies. Only physical GPU5 is authorized for future tests, not default all-GPU placement. No new/enabled CI workflows, no force push. Keep weights/data/cache out of Git.
+
+README records identity/status; docs records environment/protocol/provenance/blockers. Verification requires status, timestamp/timezone, code/lock/checkpoint hashes, command, exit code, artifacts and limitations. Static review is not a successful runtime test; missing outcomes never count as zero.
+
+
 Brief for AI coding agents working on RLinf. For full contribution flow, code style, and PR process see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Quick orientation:** RLinf is a distributed RL stack (embodied + reasoning + agent). It uses **Ray** for process management and **Hydra** for config. Single-machine runs use `cluster.num_nodes: 1`; multi-node needs Ray started on every node with `RLINF_NODE_RANK` set *before* `ray start`. Pre-commit runs Ruff (lint + format) and commit-check; use Google-style docstrings and type hints. All user-facing changes need tests and docs. If something is unclear, add a `TODO(agent)` and note the limitation.

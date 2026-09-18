@@ -1,3 +1,5 @@
+> **Evaluation fork (`main`) — planning only:** [DreamZero LIBERO handoff](docs/action-eval/README.md) · [operating rules](AGENTS.md). Execution is paused. Use local Git commits/pushes followed by server pull and reviewed locked uv sync; do not run upstream installers blindly on the shared server.
+
 <div align="center">
   <img src="https://github.com/RLinf/misc/raw/main/pic/logo_white.svg" alt="RLinf-logo" width="600"/>
 </div>
