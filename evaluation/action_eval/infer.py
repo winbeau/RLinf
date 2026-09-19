@@ -295,6 +295,16 @@ class DreamZeroPolicy:
             self._evaluation["cfg_scale"] = float(getattr(head, "cfg_scale", 0.0))
             self._evaluation["seed"] = int(getattr(head, "seed", -1))
 
+        # Compile and capture CUDA graphs *before* the benchmark creates its first
+        # renderer context. The first real predict otherwise pays ~150 s of Dynamo
+        # compilation on the same device while robosuite is creating and using an EGL
+        # context, and on this host that overlap coincides with the native
+        # ``mjr_readPixels`` abort: a DreamZero lane restarted every nine minutes
+        # without completing a single episode, while the same model ran a whole
+        # episode when it had the card to itself.
+        if bool(options.get("warmup", True)):
+            self._warmup()
+
         self._metadata_path = Path(model_cfg.get("metadata_json_path"))
         self._action_horizon = self._evaluation["action_horizon"]
         self._rng_mode = RNG_MODE_FIXED_PER_PREDICT
@@ -303,6 +313,30 @@ class DreamZeroPolicy:
         self._fingerprint: dict[str, object] = {}
 
     # -- contract ----------------------------------------------------------
+    def _warmup(self) -> None:
+        """Run one throwaway inference so compilation is not concurrent with rendering.
+
+        The dummy observation uses the benchmark's own shapes (256x256 uint8 cameras,
+        an 8-dim state, a short instruction) so that Dynamo compiles the same graph the
+        real calls will use. Nothing about the returned actions is kept.
+        """
+        import numpy as np  # noqa: PLC0415
+
+        images = {
+            "agentview": np.zeros((256, 256, 3), dtype=np.uint8),
+            "wrist": np.zeros((256, 256, 3), dtype=np.uint8),
+        }
+        env_obs = {
+            "main_images": images["agentview"][None],
+            "wrist_images": images["wrist"][None],
+            "states": np.zeros((1, 8), dtype=np.float32),
+            "task_descriptions": ["warm up the policy"],
+        }
+        try:
+            self.policy.predict_action_batch(env_obs, mode="eval")
+        except Exception as exc:  # a failed warm-up must not look like a bad model
+            print(f"[dreamzero-adapter] warm-up failed: {type(exc).__name__}: {exc}", flush=True)
+
     def describe(self) -> PolicyDescription:
         fingerprint = {
             "adapter": "rlinf-dreamzero",
