@@ -118,6 +118,37 @@ def checkpoint_digest(checkpoint: Path) -> dict[str, str]:
     return digests
 
 
+def _promote_scalars_before_load() -> None:
+    """Promote 0-d parameters at construction, not after the state dict is loaded.
+
+    ``rlinf.models.embodiment.dreamzero.get_model`` builds the model, calls
+    ``load_state_dict(strict=False)`` and only then calls
+    ``_promote_scalar_params_to_1d``. The published checkpoint is the opposite order:
+    it was converted from an FSDP model whose scalars had already been promoted, so
+    ``action_head.image_encoder.model.log_scale`` is stored with shape ``[1]`` while a
+    freshly built model has it as a 0-d parameter. ``strict=False`` forgives missing
+    and unexpected keys but not a size mismatch, so the stock order fails on exactly
+    that tensor.
+
+    Promoting inside the constructor puts the shapes right *before* the load, and
+    makes ``get_model``'s later promotion a no-op. This is the whole workaround: the
+    model is still built and loaded by RLinf's own code.
+    """
+    from rlinf.models.embodiment.dreamzero import _promote_scalar_params_to_1d
+    from rlinf.models.embodiment.dreamzero.dreamzero_policy import DreamZeroPolicy
+
+    if getattr(DreamZeroPolicy, "_promote_before_load", False):
+        return
+    original_init = DreamZeroPolicy.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _promote_scalar_params_to_1d(self)
+
+    DreamZeroPolicy.__init__ = __init__
+    DreamZeroPolicy._promote_before_load = True
+
+
 def _rl_inf(model_root: Path):
     """Import RLinf's DreamZero builder from the declared checkout."""
     if _RLINF:
@@ -132,6 +163,7 @@ def _rl_inf(model_root: Path):
         validate_dreamzero_sft_model_cfg,
     )
 
+    _promote_scalars_before_load()
     _RLINF["get_model"] = get_model
     _RLINF["validate"] = validate_dreamzero_sft_model_cfg
     return _RLINF
