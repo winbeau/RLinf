@@ -1,4 +1,4 @@
-> **Evaluation fork (`main`) — planning only:** [DreamZero LIBERO handoff](docs/action-eval/README.md) · [operating rules](AGENTS.md). Execution is paused. Use local Git commits/pushes followed by server pull and reviewed locked uv sync; do not run upstream installers blindly on the shared server.
+> **Evaluation fork (`main`) — evaluation running:** [DreamZero LIBERO handoff](docs/action-eval/README.md) · [operating rules](AGENTS.md). The DreamZero WAN2.2-5B LIBERO-SFT adapter in `evaluation/action_eval/infer.py` drives the paper runs on physical GPUs 4/5/7. Use local Git commits/pushes followed by server pull; do not run upstream installers blindly on the shared server.
 
 <div align="center">
   <img src="https://github.com/RLinf/misc/raw/main/pic/logo_white.svg" alt="RLinf-logo" width="600"/>

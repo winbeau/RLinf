@@ -2,11 +2,13 @@
 
 ## Evaluation fork constraints (override upstream operational examples)
 
-This fork maintains evaluation integration on **main**, also its GitHub default. Final user scope is **planning only, execution paused**. Future target: RLinf DreamZero WAN2.2-5B LIBERO-SFT on GPU5; no training authorization. See [handoff](docs/action-eval/README.md).
+This fork maintains evaluation integration on **main**, also its GitHub default. Current scope: the RLinf DreamZero WAN2.2-5B LIBERO-SFT checkpoint is being evaluated by action-eval through [`evaluation/action_eval/infer.py`](evaluation/action_eval/infer.py) on physical GPUs 4/5/7. No training is authorized. See [handoff](docs/action-eval/README.md).
 
 All projects follow local clone/edit → local git add/commit/push on main → compute-server git pull --ff-only → uv sync --locked → explicitly approved training/evaluation. No local installs or execution; no server application edits or copied-code deployment around Git. Check server edits and active jobs before pull/sync; never reset them. Lock generation only in isolated server staging, returned for local review/commit/push and pulled before execution.
 
-Preserve validated pyproject.toml/uv.lock byte-for-byte where compatible. Pin all necessary additions/build tools/VCS revisions exactly, explain differences and do not upgrade implicitly. Protect existing DreamZero14B environments and Ray instances. Do not run requirements/install.sh wholesale: it can rewrite shared LIBERO config and includes conflicting model dependencies. Only physical GPU5 is authorized for future tests, not default all-GPU placement. No new/enabled CI workflows, no force push. Keep weights/data/cache out of Git.
+Preserve validated pyproject.toml/uv.lock byte-for-byte where compatible. Pin all necessary additions/build tools/VCS revisions exactly, explain differences and do not upgrade implicitly. Protect existing DreamZero14B environments and Ray instances. Do not run requirements/install.sh wholesale: it can rewrite shared LIBERO config and includes conflicting model dependencies. Physical GPUs 4, 5 and 7 are authorized for the current run; never touch another card or another user's process. No new/enabled CI workflows, no force push. Keep weights/data/cache out of Git.
+
+The evaluated environment is an isolated copy of a validated DreamZero venv, not a fresh resolve: it carries torch 2.8.0+cu129, transformers 4.51.3, diffusers 0.30.2 and peft 0.5.0, which differ from what RLinf's installer would pin. That divergence is deliberate and recorded in docs/action-eval/; `torchdata` and `sortedcontainers` were added, and `action-eval-sdk` was installed into it.
 
 README records identity/status; docs records environment/protocol/provenance/blockers. Verification requires status, timestamp/timezone, code/lock/checkpoint hashes, command, exit code, artifacts and limitations. Static review is not a successful runtime test; missing outcomes never count as zero.
 
