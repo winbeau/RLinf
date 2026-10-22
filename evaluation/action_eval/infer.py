@@ -55,6 +55,21 @@ Options (``policy.options``), all optional except where noted:
                             noise from a fixed config seed (1140), so repeats of one
                             initial state are not independent samples.
 ``hash_checkpoint``         default ``True``; set ``false`` to skip hashing the shards.
+
+Sparse-acceleration case study (CVPR'27 Sparse-rethinking) options:
+
+``casestudy`` / ``casestudy_file``  the arm: ``{method: dense|anchor, keep_ratio, selection:
+                            action|random, dense_first_frames, recent_dense_frames,
+                            num_dit_steps, seed_offset, seed_mode}``. ``anchor`` uses the
+                            dreamzero fork's action-conditioned anchor key routing on the
+                            LIBERO 5x10 two-view grid (shared V->V / A->V key set, route
+                            built on the first DiT step of a call and reused).
+``shadow_casestudy``        second arm evaluated on the same observation and seed per
+                            call; logged, never executed.
+``episode_plans``           per-call arm overrides ({episode_id: {"calls": {...},
+                            "from_call": {...}}}), as in the FastWAM adapter.
+With ``seed_mode: episode_call_hash`` (default) the head's noise seed is set per call
+from (instruction, episode without repeat, call index) instead of the fixed 1140.
 """
 
 from __future__ import annotations
@@ -73,6 +88,51 @@ from action_eval_sdk import (
     PolicyDescription,
     Prediction,
 )
+
+try:
+    from action_eval_sdk import RNG_MODE_EPISODE_CALL_HASH
+except ImportError:  # pragma: no cover
+    RNG_MODE_EPISODE_CALL_HASH = "episode_call_hash"
+
+# DiT step masks of WANPolicyHead.__init__ (16 scheduler steps), by NUM_DIT_STEPS.
+_DIT_MASKS = {
+    5: [True, True, True, False, False, False, False, True, False, False, False, False, True, False, False, False],
+    6: [True, True, False, False, False, True, False, False, False, False, True, False, False, False, True, True],
+    7: [True, True, True, False, False, False, True, False, False, False, True, False, False, False, True, True],
+    8: [True, True, True, False, False, False, True, False, False, False, True, False, False, True, True, True],
+    16: [True] * 16,
+}
+_CS_DEFAULTS = {
+    "method": "dense", "keep_ratio": 0.5, "selection": "action", "dense_first_frames": 1,
+    "recent_dense_frames": 0, "num_dit_steps": 8, "seed_offset": 0, "seed_mode": "episode_call_hash",
+}
+
+
+def _parse_casestudy(raw) -> dict:
+    raw = dict(raw or {})
+    unknown = sorted(set(raw) - set(_CS_DEFAULTS))
+    if unknown:
+        raise ValueError(f"unknown casestudy keys: {unknown}")
+    cs = {**_CS_DEFAULTS, **raw}
+    if cs["method"] not in ("dense", "anchor"):
+        raise ValueError("casestudy.method must be dense or anchor")
+    if cs["selection"] not in ("action", "random"):
+        raise ValueError("casestudy.selection must be action or random")
+    if int(cs["num_dit_steps"]) not in _DIT_MASKS:
+        raise ValueError(f"num_dit_steps must be one of {sorted(_DIT_MASKS)}")
+    if not 0.0 < float(cs["keep_ratio"]) <= 1.0:
+        raise ValueError("keep_ratio must be in (0, 1]")
+    return cs
+
+
+def _call_seed(episode_key: str, call_index: int, offset: int = 0) -> int:
+    """Same per-call seed function as the FastWAM case-study adapter."""
+    digest = hashlib.sha256(f"{episode_key}|{int(call_index)}|{int(offset)}".encode()).hexdigest()
+    return int(digest[:8], 16) & 0x7FFFFFFF
+
+
+def _cs_hash(cs: dict) -> str:
+    return hashlib.sha256(json.dumps(cs, sort_keys=True).encode()).hexdigest()[:16]
 
 #: Populated on first use so importing this file for a contract check needs no torch.
 _RLINF: dict[str, object] = {}
@@ -307,7 +367,29 @@ class DreamZeroPolicy:
 
         self._metadata_path = Path(model_cfg.get("metadata_json_path"))
         self._action_horizon = self._evaluation["action_horizon"]
-        self._rng_mode = RNG_MODE_FIXED_PER_PREDICT
+
+        # -- case study --
+        raw_arm, self.arm_name = options.get("casestudy"), None
+        if options.get("casestudy_file"):
+            import yaml  # noqa: PLC0415
+
+            arm = yaml.safe_load(Path(options["casestudy_file"]).read_text()) or {}
+            self.arm_name, raw_arm = arm.get("name"), arm.get("casestudy")
+        self.casestudy = _parse_casestudy(raw_arm)
+        self.shadow_cs = (
+            None if options.get("shadow_casestudy") is None else _parse_casestudy(options["shadow_casestudy"])
+        )
+        self.shadow_executed = int(options.get("shadow_executed", 10))
+        self.episode_plans = {}
+        if options.get("episode_plans"):
+            self.episode_plans = json.loads(Path(options["episode_plans"]).read_text())
+        self._plan: dict = {}
+        self._episode_key = ""
+        self._dit = getattr(self.policy.action_head, "model", None)
+        self._rng_mode = (
+            RNG_MODE_EPISODE_CALL_HASH if self.casestudy["seed_mode"] == "episode_call_hash"
+            else RNG_MODE_FIXED_PER_PREDICT
+        )
         self._hash_checkpoint = bool(options.get("hash_checkpoint", True))
         self.predict_calls = 0
         self._fingerprint: dict[str, object] = {}
@@ -369,6 +451,11 @@ class DreamZeroPolicy:
             "cfg_scale": self._evaluation.get("cfg_scale"),
             "model_seed": self._evaluation.get("seed"),
             "rng_mode": self._rng_mode,
+            "arm": self.arm_name,
+            "casestudy": self.casestudy,
+            "casestudy_hash": _cs_hash(self.casestudy),
+            "shadow": self.shadow_cs,
+            "episode_plans_count": len(self.episode_plans),
         }
         self._fingerprint = fingerprint
         return PolicyDescription(
@@ -400,6 +487,62 @@ class DreamZeroPolicy:
                 if hasattr(head, attribute):
                     setattr(head, attribute, None)
         self.predict_calls = 0
+        import re  # noqa: PLC0415
+
+        episode_id = str(episode.get("episode_id", ""))
+        self._episode_key = f"{episode.get('instruction', '')}|{re.sub(r'-r[0-9]+', '', episode_id)}"
+        self._plan = self.episode_plans.get(episode_id, {})
+
+    # -- case study helpers --------------------------------------------------
+    def _arm_for_call(self, call_index: int):
+        calls = self._plan.get("calls") or {}
+        if str(call_index) in calls:
+            return _parse_casestudy(calls[str(call_index)]), f"call:{call_index}"
+        frm = self._plan.get("from_call")
+        if frm and call_index >= int(frm["call"]):
+            return _parse_casestudy(frm["casestudy"]), f"from:{frm['call']}"
+        return self.casestudy, None
+
+    def _apply_arm(self, cs: dict, seed: int) -> None:
+        head = self.policy.action_head
+        head.seed = int(seed)
+        head.dit_step_mask = list(_DIT_MASKS[int(cs["num_dit_steps"])])
+        if self._dit is not None and hasattr(self._dit, "configure_anchor_sparse_attention"):
+            if cs["method"] == "anchor":
+                self._dit.configure_anchor_sparse_attention(
+                    enabled=True, keep_ratio=float(cs["keep_ratio"]),
+                    recent_dense_frames=int(cs["recent_dense_frames"]),
+                    view_layout="libero_side_by_side", grid_height=5, grid_width=10,
+                    dense_first_frames=int(cs["dense_first_frames"]), selection=cs["selection"],
+                    random_seed=(int(seed) + 1) & 0x7FFFFFFF, record_diagnostics=True, reuse_denoise=True,
+                )
+            else:
+                self._dit.configure_anchor_sparse_attention(enabled=False)
+            # The route cache key repeats across calls (current_start_frame resets to 0).
+            self._dit.clear_anchor_sparse_route_cache()
+        elif cs["method"] == "anchor":
+            raise RuntimeError("this dreamzero checkout has no anchor sparse attention")
+
+    def _infer(self, env_obs: dict, cs: dict, seed: int):
+        self._apply_arm(cs, seed)
+        actions, _result = self.policy.predict_action_batch(env_obs, mode="eval")
+        diag: dict = {"seed": int(seed), "method": cs["method"], "num_dit_steps": int(cs["num_dit_steps"])}
+        if cs["method"] == "anchor" and self._dit is not None:
+            route = self._dit.get_last_anchor_route()
+            if route is not None and getattr(route, "scores", None) is not None:
+                import torch  # noqa: PLC0415
+
+                scores = route.scores.float()  # [B, F, 50]
+                first = int(cs["dense_first_frames"])
+                frame_seq = scores.shape[-1]
+                idx = route.video_indices[0].long()
+                sparse = idx[(idx >= first * frame_seq)]
+                flat = scores[0].reshape(-1)
+                total = flat[first * frame_seq:].clamp_min(0).sum()
+                if float(total) > 0:
+                    diag["kept_score_mass_fraction"] = float(flat[sparse].clamp_min(0).sum() / total)
+                diag["kept_video_keys"] = int(idx.numel())
+        return np.asarray(actions, dtype=np.float32), diag
 
     def predict(self, observation: dict) -> Prediction:
         import time  # noqa: PLC0415
@@ -431,9 +574,29 @@ class DreamZeroPolicy:
             "task_descriptions": [instruction],
         }
 
+        call_index = self.predict_calls
+        cs, override = self._arm_for_call(call_index)
+        if cs["seed_mode"] == "episode_call_hash":
+            seed = _call_seed(self._episode_key, call_index, int(cs["seed_offset"]))
+        else:
+            seed = 1140
         started = time.monotonic()
-        actions, _result = self.policy.predict_action_batch(env_obs, mode="eval")
+        actions, diag = self._infer(env_obs, cs, seed)
         elapsed = time.monotonic() - started
+        if override is not None:
+            diag["plan_override"] = {"label": override, "casestudy_hash": _cs_hash(cs)}
+        if self.shadow_cs is not None:
+            shadow, sdiag = self._infer(env_obs, self.shadow_cs, seed)
+            a, b, k = actions[0], shadow[0], self.shadow_executed
+            d = a - b
+            diag["shadow"] = {
+                "rms_executed": float(np.sqrt(np.mean(d[:k, :6] ** 2))),
+                "rms_full": float(np.sqrt(np.mean(d[:, :6] ** 2))),
+                "max_abs_executed": float(np.abs(d[:k, :6]).max()),
+                "gripper_disagree_executed": int(np.sum(np.sign(a[:k, -1]) != np.sign(b[:k, -1]))),
+                "translation_diff_executed": float(np.linalg.norm(a[:k, :3].sum(0) - b[:k, :3].sum(0))),
+                "rotation_diff_executed": float(np.linalg.norm(a[:k, 3:6].sum(0) - b[:k, 3:6].sum(0))),
+            }
 
         actions = np.asarray(actions, dtype=np.float32)
         if actions.ndim != 3 or actions.shape[0] != 1:
@@ -450,6 +613,8 @@ class DreamZeroPolicy:
             diagnostics={
                 "horizon": int(chunk.shape[0]),
                 "predict_call_index": self.predict_calls,
+                "call_index": call_index,
+                **diag,
             },
         )
 
