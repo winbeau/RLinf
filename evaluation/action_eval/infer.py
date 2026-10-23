@@ -586,7 +586,10 @@ class DreamZeroPolicy:
         if override is not None:
             diag["plan_override"] = {"label": override, "casestudy_hash": _cs_hash(cs)}
         if self.shadow_cs is not None:
-            shadow, sdiag = self._infer(env_obs, self.shadow_cs, seed)
+            # The shadow draws its own noise (its seed_offset), as in the FastWAM adapter.
+            shadow_seed = (_call_seed(self._episode_key, call_index, int(self.shadow_cs["seed_offset"]))
+                           if self.shadow_cs["seed_mode"] == "episode_call_hash" else seed)
+            shadow, sdiag = self._infer(env_obs, self.shadow_cs, shadow_seed)
             a, b, k = actions[0], shadow[0], self.shadow_executed
             d = a - b
             diag["shadow"] = {
