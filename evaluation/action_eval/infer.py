@@ -380,6 +380,14 @@ class DreamZeroPolicy:
             None if options.get("shadow_casestudy") is None else _parse_casestudy(options["shadow_casestudy"])
         )
         self.shadow_executed = int(options.get("shadow_executed", 10))
+        # Exact execution options (off by default): cross_kv_cache = per-call cross-attention K/V cache
+        # in the DreamZero DiT (dreamzero branch perf); must reproduce the default path bit for bit.
+        self.execution = dict(options.get("execution") or {})
+        unknown = set(self.execution) - {"cross_kv_cache"}
+        if unknown:
+            raise ValueError(f"unknown execution options: {sorted(unknown)}")
+        if self.execution.get("cross_kv_cache"):
+            self.policy.action_head.exact_cross_kv_cache = True
         self.episode_plans = {}
         if options.get("episode_plans"):
             self.episode_plans = json.loads(Path(options["episode_plans"]).read_text())
@@ -455,6 +463,7 @@ class DreamZeroPolicy:
             "casestudy": self.casestudy,
             "casestudy_hash": _cs_hash(self.casestudy),
             "shadow": self.shadow_cs,
+            "execution": self.execution,
             "episode_plans_count": len(self.episode_plans),
         }
         self._fingerprint = fingerprint
