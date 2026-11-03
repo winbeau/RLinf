@@ -70,6 +70,17 @@ Sparse-acceleration case study (CVPR'27 Sparse-rethinking) options:
                             "from_call": {...}}}), as in the FastWAM adapter.
 With ``seed_mode: episode_call_hash`` (default) the head's noise seed is set per call
 from (instruction, episode without repeat, call index) instead of the fixed 1140.
+``inject_future``           optional {frames_dir, deltas, seeds, decode_dir, frame_offsets}: future-injection
+                            probes (future-inject-dz round), as in the FastWAM adapter. On every call whose
+                            rendered rollout ``<frames_dir>/<episode>.npz`` (action-eval
+                            ``future_frames.py``) marks ``call_ok``, for every seed offset: dense (normal),
+                            F_dense (dense's own final video block injected) and F_real(delta) for the valid
+                            deltas (frames t + round(k_i delta), k_i = ``frame_offsets``, default 2, 4, .., 16,
+                            through the transform chain and the VAE with the current frame first, injected).
+                            Injection = ``WANPolicyHead.inject_future_latents``: clean video block at timestep 0,
+                            fixed, only the action denoised. ``decode_dir`` saves dense's decoded video at seed
+                            offset 0. Logged in ``diagnostics.inject``; needs a dense arm with
+                            ``seed_mode: episode_call_hash``.
 """
 
 from __future__ import annotations
@@ -394,6 +405,36 @@ class DreamZeroPolicy:
         self.predict_calls = 0
         self._fingerprint: dict[str, object] = {}
 
+        # -- future injection (future-inject-dz) --
+        self.inject = None
+        self._inject_frames = None
+        self._captured: dict = {}
+        if options.get("inject_future") is not None:
+            f = dict(options["inject_future"])
+            unknown = sorted(set(f) - {"frames_dir", "deltas", "seeds", "decode_dir", "frame_offsets"})
+            if unknown or not f.get("frames_dir"):
+                raise ValueError(f"inject_future needs frames_dir (unknown keys: {unknown})")
+            self.inject = {
+                "frames_dir": Path(str(f["frames_dir"])), "deltas": [float(x) for x in f.get("deltas") or ()],
+                "seeds": [int(x) for x in f.get("seeds") or (0,)],
+                "decode_dir": None if not f.get("decode_dir") else Path(str(f["decode_dir"])),
+                "frame_offsets": [int(x) for x in f.get("frame_offsets") or range(2, 17, 2)],
+            }
+            if self.casestudy["method"] != "dense" or self.casestudy["seed_mode"] != "episode_call_hash":
+                raise ValueError("inject_future needs a dense executed arm with seed_mode=episode_call_hash")
+            from tianshou.data import Batch  # noqa: PLC0415 - the batch type of RLinf's DreamZeroPolicy
+
+            self._batch_cls = Batch
+            inner = self.policy.lazy_joint_video_action_causal
+
+            def capture(inputs, latent_video=None):
+                out = inner(inputs, latent_video=latent_video)
+                self._captured = {"images": inputs["images"], "video": out["video_pred"]}
+                return out
+
+            # predict_action_batch calls self.lazy_joint_video_action_causal: the instance attribute wins.
+            self.policy.lazy_joint_video_action_causal = capture
+
     # -- contract ----------------------------------------------------------
     def _warmup(self) -> None:
         """Run one throwaway inference so compilation is not concurrent with rendering.
@@ -456,6 +497,8 @@ class DreamZeroPolicy:
             "casestudy_hash": _cs_hash(self.casestudy),
             "shadow": self.shadow_cs,
             "episode_plans_count": len(self.episode_plans),
+            "inject_future": None if self.inject is None else {
+                k: str(v) if isinstance(v, Path) else v for k, v in self.inject.items()},
         }
         self._fingerprint = fingerprint
         return PolicyDescription(
@@ -490,8 +533,17 @@ class DreamZeroPolicy:
         import re  # noqa: PLC0415
 
         episode_id = str(episode.get("episode_id", ""))
+        self._episode_id = episode_id
         self._episode_key = f"{episode.get('instruction', '')}|{re.sub(r'-r[0-9]+', '', episode_id)}"
         self._plan = self.episode_plans.get(episode_id, {})
+        if self.inject is not None:
+            path = self.inject["frames_dir"] / f"{re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
+            if not path.is_file():
+                raise FileNotFoundError(f"inject_future: no rendered frames {path}")
+            with np.load(path) as z:
+                self._inject_frames = {k: z[k] for k in ("agentview", "wrist", "deltas", "call_ok", "valid")}
+            if [float(x) for x in self._inject_frames["deltas"]] != self.inject["deltas"]:
+                raise ValueError(f"inject_future: {path} has deltas {self._inject_frames['deltas']}, not {self.inject['deltas']}")
 
     # -- case study helpers --------------------------------------------------
     def _arm_for_call(self, call_index: int):
@@ -543,6 +595,72 @@ class DreamZeroPolicy:
                     diag["kept_score_mass_fraction"] = float(flat[sparse].clamp_min(0).sum() / total)
                 diag["kept_video_keys"] = int(idx.numel())
         return np.asarray(actions, dtype=np.float32), diag
+
+    @staticmethod
+    def _chunk_log(actions: np.ndarray) -> dict:
+        """Chunk [T, 7] in simulator units as float32 base64 (gripper binarised; the 6 motion dims as predicted)."""
+        import base64  # noqa: PLC0415
+
+        return {"actions_f32": base64.b64encode(np.asarray(actions[0], dtype=np.float32).tobytes()).decode()}
+
+    def _infer_injected(self, env_obs: dict, seed: int, future) -> np.ndarray:
+        head = self.policy.action_head
+        head.inject_future_latents = future
+        try:
+            actions, _ = self._infer(env_obs, self.casestudy, seed)
+        finally:
+            head.inject_future_latents = None
+        return actions
+
+    def _inject_call(self, env_obs: dict, images: dict, call_index: int, dense_actions: np.ndarray) -> dict:
+        """Future-injection probes of one call (option ``inject_future``): dense, F_dense and F_real(delta) at every
+        seed offset, on the observation of the replayed dense rollout."""
+        torch = self._torch
+        fr, inj = self._inject_frames, self.inject
+        if call_index >= len(fr["call_ok"]) or not bool(fr["call_ok"][call_index]):
+            return {"used": False}
+        head = self.policy.action_head
+        # Read what the executed call left behind before any probe overwrites it.
+        current, video0 = self._captured["images"], self._captured["video"]
+        first = head.ys[:, 4:, 0:1].float()  # frame-0 latent of encode_image (behind the 4 mask channels)
+        t = 10 * call_index  # frame index of this call's observation: after 10 c executed steps
+        out: dict = {"used": True, "valid": [bool(x) for x in fr["valid"][call_index]],
+                     "current_frame_equal": bool(np.array_equal(fr["agentview"][t], images["agentview"])
+                                                 and np.array_equal(fr["wrist"][t], images["wrist"]))}
+
+        def processed(j: int):
+            obs = dict(env_obs, main_images=np.ascontiguousarray(fr["agentview"][j])[None],
+                       wrist_images=np.ascontiguousarray(fr["wrist"][j])[None])
+            return self.policy._process_batch(self._batch_cls(obs=self.policy._observation_convert(obs)))["images"]
+
+        latents: dict[float, object] = {}
+        for k, delta in enumerate(inj["deltas"]):
+            if out["valid"][k]:
+                # floor(x + 0.5): half-up rounding of k_i * delta (DECISIONS.md, B)
+                idx = [t + int(np.floor(off * delta + 0.5)) for off in inj["frame_offsets"]]
+                clip = torch.cat([current.to("cuda")] + [processed(j).to("cuda") for j in idx], dim=1)
+                latents[delta] = head.encode_future_clip(clip)
+        if latents:
+            out["frame0_latent_max_abs"] = max(float((z[:, :, 0:1].float() - first).abs().max()) for z in latents.values())
+            out["frame0_latent_scale"] = float(first.abs().max())
+        entries = {}
+        for j in inj["seeds"]:
+            seed = _call_seed(self._episode_key, call_index, j)
+            if j == 0:
+                a_d, vid = dense_actions, video0
+            else:
+                a_d, _ = self._infer(env_obs, self.casestudy, seed)
+                vid = self._captured["video"]
+            entries[f"dense@{j}"] = self._chunk_log(a_d)
+            entries[f"Fd@{j}"] = self._chunk_log(self._infer_injected(env_obs, seed, vid[:, :, 1:]))
+            for delta, z in latents.items():
+                entries[f"Fr{delta:g}@{j}"] = self._chunk_log(self._infer_injected(env_obs, seed, z[:, :, 1:]))
+            if j == 0 and inj["decode_dir"] is not None:
+                inj["decode_dir"].mkdir(parents=True, exist_ok=True)
+                frames = head.decode_latents(vid)[0].cpu().numpy()
+                np.savez_compressed(inj["decode_dir"] / f"{self._episode_id}-c{call_index:02d}.npz", dense_future=frames)
+        out["entries"] = entries
+        return out
 
     def predict(self, observation: dict) -> Prediction:
         import time  # noqa: PLC0415
@@ -600,6 +718,9 @@ class DreamZeroPolicy:
                 "translation_diff_executed": float(np.linalg.norm(a[:k, :3].sum(0) - b[:k, :3].sum(0))),
                 "rotation_diff_executed": float(np.linalg.norm(a[:k, 3:6].sum(0) - b[:k, 3:6].sum(0))),
             }
+
+        if self.inject is not None:
+            diag["inject"] = self._inject_call(env_obs, images, call_index, actions)
 
         actions = np.asarray(actions, dtype=np.float32)
         if actions.ndim != 3 or actions.shape[0] != 1:
