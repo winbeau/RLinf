@@ -77,9 +77,11 @@ from (instruction, episode without repeat, call index) instead of the fixed 1140
                             F_dense (dense's own final video block injected) and F_real(delta) for the valid
                             deltas (frames t + round(k_i delta), k_i = ``frame_offsets``, default 2, 4, .., 16,
                             through the transform chain and the VAE with the current frame first, injected).
-                            Injection = ``WANPolicyHead.inject_future_latents``: clean video block at timestep 0,
-                            fixed, only the action denoised. ``decode_dir`` saves dense's decoded video at seed
-                            offset 0. Logged in ``diagnostics.inject``; needs a dense arm with
+                            Injection = ``WANPolicyHead.inject_future_latents``; ``mode`` ``clean`` (default):
+                            video block at timestep 0, fixed, only the action denoised; ``renoise``: the block
+                            re-noised at every step to that step's noise level with the call's video noise, at
+                            the normal video timestep (``inject_future_renoise``). ``decode_dir`` saves dense's
+                            decoded video at seed offset 0. Logged in ``diagnostics.inject``; needs a dense arm with
                             ``seed_mode: episode_call_hash``.
 """
 
@@ -411,7 +413,7 @@ class DreamZeroPolicy:
         self._captured: dict = {}
         if options.get("inject_future") is not None:
             f = dict(options["inject_future"])
-            unknown = sorted(set(f) - {"frames_dir", "deltas", "seeds", "decode_dir", "frame_offsets"})
+            unknown = sorted(set(f) - {"frames_dir", "deltas", "seeds", "decode_dir", "frame_offsets", "mode"})
             if unknown or not f.get("frames_dir"):
                 raise ValueError(f"inject_future needs frames_dir (unknown keys: {unknown})")
             self.inject = {
@@ -419,7 +421,10 @@ class DreamZeroPolicy:
                 "seeds": [int(x) for x in f.get("seeds") or (0,)],
                 "decode_dir": None if not f.get("decode_dir") else Path(str(f["decode_dir"])),
                 "frame_offsets": [int(x) for x in f.get("frame_offsets") or range(2, 17, 2)],
+                "mode": str(f.get("mode", "clean")),
             }
+            if self.inject["mode"] not in ("clean", "renoise"):
+                raise ValueError("inject_future.mode must be clean or renoise")
             if self.casestudy["method"] != "dense" or self.casestudy["seed_mode"] != "episode_call_hash":
                 raise ValueError("inject_future needs a dense executed arm with seed_mode=episode_call_hash")
             from tianshou.data import Batch  # noqa: PLC0415 - the batch type of RLinf's DreamZeroPolicy
@@ -606,10 +611,12 @@ class DreamZeroPolicy:
     def _infer_injected(self, env_obs: dict, seed: int, future) -> np.ndarray:
         head = self.policy.action_head
         head.inject_future_latents = future
+        head.inject_future_renoise = self.inject["mode"] == "renoise"
         try:
             actions, _ = self._infer(env_obs, self.casestudy, seed)
         finally:
             head.inject_future_latents = None
+            head.inject_future_renoise = False
         return actions
 
     def _inject_call(self, env_obs: dict, images: dict, call_index: int, dense_actions: np.ndarray) -> dict:
