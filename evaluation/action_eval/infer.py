@@ -121,7 +121,7 @@ _DIT_MASKS = {
 _CS_DEFAULTS = {
     "method": "dense", "keep_ratio": 0.5, "selection": "action", "dense_first_frames": 1,
     "recent_dense_frames": 0, "num_dit_steps": 8, "seed_offset": 0, "seed_mode": "episode_call_hash",
-    "action_no_future": False,
+    "action_no_future": False, "jump": None, "gen": None,
 }
 
 
@@ -131,8 +131,12 @@ def _parse_casestudy(raw) -> dict:
     if unknown:
         raise ValueError(f"unknown casestudy keys: {unknown}")
     cs = {**_CS_DEFAULTS, **raw}
-    if cs["method"] not in ("dense", "anchor"):
-        raise ValueError("casestudy.method must be dense or anchor")
+    if cs["method"] not in ("dense", "anchor", "jump"):
+        raise ValueError("casestudy.method must be dense, anchor or jump")
+    if (cs["method"] == "jump") != isinstance(cs["jump"], dict):
+        raise ValueError("casestudy.method jump (generality JUMP-sparse) goes with a jump dict {gain, s1, last, seed, far_lambda}")
+    if cs["gen"] is not None and (cs["method"] != "dense" or not isinstance(cs["gen"], dict)):
+        raise ValueError("casestudy.gen (generality diagnostics) is a dict on a dense arm")
     if cs["selection"] not in ("action", "random"):
         raise ValueError("casestudy.selection must be action or random")
     if int(cs["num_dit_steps"]) not in _DIT_MASKS:
@@ -399,12 +403,20 @@ class DreamZeroPolicy:
             None if options.get("shadow_casestudy") is None else _parse_casestudy(options["shadow_casestudy"])
         )
         self.shadow_executed = int(options.get("shadow_executed", 10))
+        # generality: probe arms on the executed observation, per probe seed offset (an arm may list its own ``offsets``)
+        self.probes = [(str(p["name"]), _parse_casestudy(p["casestudy"]), None if p.get("offsets") is None else [int(x) for x in p["offsets"]])
+                       for p in options.get("probe_arms") or ()]
+        self.probe_seed_offsets = [int(x) for x in options.get("probe_seed_offsets") or (0,)]
+        self.probe_calls = None if options.get("probe_calls") is None else {int(x) for x in options["probe_calls"]}
         self.episode_plans = {}
         if options.get("episode_plans"):
             self.episode_plans = json.loads(Path(options["episode_plans"]).read_text())
         self._plan: dict = {}
         self._episode_key = ""
         self._dit = getattr(self.policy.action_head, "model", None)
+        from tianshou.data import Batch as _Batch  # noqa: PLC0415 - the batch type of RLinf's DreamZeroPolicy
+
+        self._batch_cls = _Batch
         self._rng_mode = (
             RNG_MODE_EPISODE_CALL_HASH if self.casestudy["seed_mode"] == "episode_call_hash"
             else RNG_MODE_FIXED_PER_PREDICT
@@ -575,6 +587,11 @@ class DreamZeroPolicy:
         head = self.policy.action_head
         head.seed = int(seed)
         head.dit_step_mask = list(_DIT_MASKS[int(cs["num_dit_steps"])])
+        if hasattr(head, "cs_jump"):  # generality (dreamzero cs_generality.py)
+            head.cs_jump = dict(cs["jump"]) if cs["method"] == "jump" else None
+            head.cs_gen = dict(cs["gen"]) if cs["gen"] is not None else None
+        elif cs["method"] == "jump" or cs["gen"] is not None:
+            raise RuntimeError("this dreamzero checkout has no generality case-study hooks")
         if self._dit is not None and hasattr(self._dit, "configure_anchor_sparse_attention"):
             if cs["method"] == "anchor":
                 self._dit.configure_anchor_sparse_attention(
@@ -596,6 +613,9 @@ class DreamZeroPolicy:
         self._apply_arm(cs, seed)
         actions, _result = self.policy.predict_action_batch(env_obs, mode="eval")
         diag: dict = {"seed": int(seed), "method": cs["method"], "num_dit_steps": int(cs["num_dit_steps"])}
+        cs_diag = getattr(self.policy.action_head, "cs_last_diag", None)
+        if cs_diag is not None:
+            diag["cs"] = self._cs_units(cs_diag, env_obs)
         if cs["method"] == "anchor" and self._dit is not None:
             route = self._dit.get_last_anchor_route()
             if route is not None and getattr(route, "scores", None) is not None:
@@ -612,6 +632,43 @@ class DreamZeroPolicy:
                     diag["kept_score_mass_fraction"] = float(flat[sparse].clamp_min(0).sum() / total)
                 diag["kept_video_keys"] = int(idx.numel())
         return np.asarray(actions, dtype=np.float32), diag
+
+    def _cs_units(self, cs_diag: dict, env_obs: dict) -> dict:
+        """generality: the head's normalized action chunks (``gen.actions``) through RLinf's own unapply -> per name the executed
+        displacement ``D`` and rotation ``R`` (first ``n_exec`` actions summed) and the gripper ``G`` (simulator units, not binarised)."""
+        import base64  # noqa: PLC0415
+
+        import torch  # noqa: PLC0415
+
+        out = {k: v for k, v in cs_diag.items() if k != "gen"}
+        gen = cs_diag.get("gen")
+        if gen is None:
+            return out
+        gen = dict(gen)
+        n = int(gen.get("n_exec", 10))
+        conv = self.policy._observation_convert(env_obs)
+        D, R, G = {}, {}, {}
+        for name, b64 in (gen.pop("actions", None) or {}).items():
+            a = np.frombuffer(base64.b64decode(b64), dtype=np.float32)
+            t = torch.from_numpy(a.copy()).reshape(1, -1, self.policy.action_head.model.action_dim).to("cuda")
+            act = self.policy._actions_from_unapply(self.policy.unapply(self._batch_cls(normalized_action=t), obs=conv).act)
+            c = np.asarray(act, dtype=np.float64)[0][:n]
+            D[name], R[name], G[name] = [float(x) for x in c[:, 0:3].sum(0)], [float(x) for x in c[:, 3:6].sum(0)], [float(x) for x in c[:, -1]]
+        gen.update(D=D, R=R, G=G)
+        out["gen"] = gen
+        return out
+
+    def _probe_call(self, env_obs: dict, call_index: int) -> dict:
+        """generality: every probe arm at every probe seed offset (or its own offsets) on this observation, never executed."""
+        out = {}
+        for offset in self.probe_seed_offsets:
+            seed = _call_seed(self._episode_key, call_index, offset)
+            for name, arm, offsets in self.probes:
+                if offsets is not None and offset not in offsets:
+                    continue
+                a, d = self._infer(env_obs, arm, seed)
+                out[f"{name}@{offset}"] = {**self._chunk_log(a), **d}
+        return out
 
     @staticmethod
     def _chunk_log(actions: np.ndarray) -> dict:
@@ -756,6 +813,8 @@ class DreamZeroPolicy:
 
         if self.inject is not None:
             diag["inject"] = self._inject_call(env_obs, images, call_index, actions)
+        if self.probes and (self.probe_calls is None or call_index in self.probe_calls):
+            diag["probes"] = self._probe_call(env_obs, call_index)
 
         actions = np.asarray(actions, dtype=np.float32)
         if actions.ndim != 3 or actions.shape[0] != 1:
