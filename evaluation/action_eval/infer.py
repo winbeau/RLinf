@@ -121,7 +121,7 @@ _DIT_MASKS = {
 _CS_DEFAULTS = {
     "method": "dense", "keep_ratio": 0.5, "selection": "action", "dense_first_frames": 1,
     "recent_dense_frames": 0, "num_dit_steps": 8, "seed_offset": 0, "seed_mode": "episode_call_hash",
-    "action_no_future": False, "jump": None, "gen": None,
+    "action_no_future": False, "jump": None, "gen": None, "chain2": None,
 }
 
 
@@ -145,6 +145,13 @@ def _parse_casestudy(raw) -> dict:
         raise ValueError("keep_ratio must be in (0, 1]")
     if cs["action_no_future"] and cs["method"] != "anchor":
         raise ValueError("action_no_future (S0-noF) needs method anchor")
+    if cs["chain2"] is not None:  # chain2-curves: the R arm's last-step reads from the call's body mask (chain2_reads.py)
+        c2 = cs["chain2"]
+        if (not isinstance(c2, dict) or cs["method"] != "jump" or str(cs["jump"].get("mode")) != "r"
+                or str(c2.get("read")) not in ("full", "bg", "bd", "bdnb", "s", "c") or set(c2) - {"read", "x", "n"}
+                or (c2["read"] in ("bg", "bd", "bdnb") and not 0.0 <= float(c2.get("x", -1)) <= 1.0)
+                or (c2["read"] in ("s", "c") and int(c2.get("n", 0)) < 1)):
+            raise ValueError("casestudy.chain2 {read: full|bg|bd|bdnb (x)|s|c (n)} needs method jump with jump.mode r")
     return cs
 
 
@@ -407,6 +414,20 @@ class DreamZeroPolicy:
         self.probes = [(str(p["name"]), _parse_casestudy(p["casestudy"]), None if p.get("offsets") is None else [int(x) for x in p["offsets"]])
                        for p in options.get("probe_arms") or ()]
         self.probe_seed_offsets = [int(x) for x in options.get("probe_seed_offsets") or (0,)]
+        # chain2-curves: {calib_dir, tips, sinks} for arms with casestudy.chain2 (the body mask online from observation extra
+        # robot_joints, benchmark.joint_state); seed_offset_per_repeat: repeats of one episode are independent noise draws (as FastWAM)
+        self.chain2 = None
+        if options.get("chain2") is not None:
+            import sys as _sys  # noqa: PLC0415
+
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            c2 = dict(options["chain2"])
+            self.chain2 = {"calib_dir": Path(c2["calib_dir"]), "tips": [int(x) for x in c2["tips"]],
+                           "sinks": [int(x) for x in c2.get("sinks") or ()]}
+        self.seed_offset_per_repeat = bool(options.get("seed_offset_per_repeat", False))
+        self._repeat_offset = 0
+        self._chain2_calib = None
+        self._chain2_body = None
         self.probe_calls = None if options.get("probe_calls") is None else {int(x) for x in options["probe_calls"]}
         self.episode_plans = {}
         if options.get("episode_plans"):
@@ -563,6 +584,14 @@ class DreamZeroPolicy:
         episode_id = str(episode.get("episode_id", ""))
         self._episode_id = episode_id
         self._episode_key = f"{episode.get('instruction', '')}|{re.sub(r'-r[0-9]+', '', episode_id)}"
+        self._repeat_offset = int(episode.get("repeat") or 0) if self.seed_offset_per_repeat else 0
+        if self.chain2 is not None:
+            path = self.chain2["calib_dir"] / f"calib-{re.sub(r'-r[0-9]+.*$', '', episode_id)}.json"
+            if not path.is_file():
+                raise FileNotFoundError(f"chain2: no calibration {path}")
+            self._chain2_calib = json.loads(path.read_text())
+            if not self._chain2_calib.get("q_obs"):
+                raise ValueError(f"chain2: {path} has no q_obs")
         self._plan = self.episode_plans.get(episode_id, {})
         if self.inject is not None:
             path = self.inject["frames_dir"] / f"{re.sub(r'-r[0-9]+.*$', '', episode_id)}.npz"
@@ -611,8 +640,20 @@ class DreamZeroPolicy:
 
     def _infer(self, env_obs: dict, cs: dict, seed: int):
         self._apply_arm(cs, seed)
+        c2info = None
+        if cs.get("chain2") is not None:
+            # chain2-curves: the R arm's last-step rows and per-key biases for this call (its body set, its noise seed)
+            import chain2_reads as _c2  # noqa: PLC0415
+
+            if self._chain2_body is None:
+                raise ValueError("a chain2 arm needs the adapter option chain2 (calibrations, fingertips, sinks)")
+            rows, bias, c2info = _c2.rows_bias(cs["chain2"], self._chain2_body["body"], self.chain2["tips"], self.chain2["sinks"], seed)
+            self.policy.action_head.cs_jump.update(last_rows=rows, last_bias=bias)
+            c2info.update(rows=rows, bias=sorted({round(b, 6) for b in bias}), draw_seed=int(seed))
         actions, _result = self.policy.predict_action_batch(env_obs, mode="eval")
         diag: dict = {"seed": int(seed), "method": cs["method"], "num_dit_steps": int(cs["num_dit_steps"])}
+        if c2info is not None:
+            diag["chain2"] = c2info
         cs_diag = getattr(self.policy.action_head, "cs_last_diag", None)
         if cs_diag is not None:
             diag["cs"] = self._cs_units(cs_diag, env_obs)
@@ -662,7 +703,7 @@ class DreamZeroPolicy:
         """generality: every probe arm at every probe seed offset (or its own offsets) on this observation, never executed."""
         out = {}
         for offset in self.probe_seed_offsets:
-            seed = _call_seed(self._episode_key, call_index, offset)
+            seed = _call_seed(self._episode_key, call_index, offset + self._repeat_offset)
             for name, arm, offsets in self.probes:
                 if offsets is not None and offset not in offsets:
                     continue
@@ -784,20 +825,32 @@ class DreamZeroPolicy:
             "task_descriptions": [instruction],
         }
 
+        if self.chain2 is not None:
+            # chain2-curves: this call's agentview body set on DreamZero's grid, from the joint values and the calibration only
+            import chain2_reads as _c2  # noqa: PLC0415
+
+            joints = (observation.get("extra") or {}).get("robot_joints")
+            if joints is None:
+                raise ValueError("chain2 needs observation extra robot_joints (benchmark.joint_state: true)")
+            q = np.asarray(joints, dtype=np.float64)[np.asarray(self._chain2_calib["q_obs"])]
+            self._chain2_body = _c2.body(q, self._chain2_calib)
+
         call_index = self.predict_calls
         cs, override = self._arm_for_call(call_index)
         if cs["seed_mode"] == "episode_call_hash":
-            seed = _call_seed(self._episode_key, call_index, int(cs["seed_offset"]))
+            seed = _call_seed(self._episode_key, call_index, int(cs["seed_offset"]) + self._repeat_offset)
         else:
             seed = 1140
         started = time.monotonic()
         actions, diag = self._infer(env_obs, cs, seed)
         elapsed = time.monotonic() - started
+        if self._chain2_body is not None:
+            diag["chain2_body"] = dict(self._chain2_body)
         if override is not None:
             diag["plan_override"] = {"label": override, "casestudy_hash": _cs_hash(cs)}
         if self.shadow_cs is not None:
             # The shadow draws its own noise (its seed_offset), as in the FastWAM adapter.
-            shadow_seed = (_call_seed(self._episode_key, call_index, int(self.shadow_cs["seed_offset"]))
+            shadow_seed = (_call_seed(self._episode_key, call_index, int(self.shadow_cs["seed_offset"]) + self._repeat_offset)
                            if self.shadow_cs["seed_mode"] == "episode_call_hash" else seed)
             shadow, sdiag = self._infer(env_obs, self.shadow_cs, shadow_seed)
             a, b, k = actions[0], shadow[0], self.shadow_executed
